@@ -2917,37 +2917,114 @@ const GRUPOS_PAGAMENTO = [
   { label: 'Pendente', cor: 'var(--cor-alerta)', fundo: '#F6E2D8' },
 ];
 
-function FormSaidaRapida({ db, profile, data }) {
+// Formulário de saída com vários métodos de pagamento e parte "a pagar"
+// (o que fica a pagar vai sozinho para Contas a pagar)
+function FormSaidaRapida({ db, profile, data, comData }) {
   const [categoria, setCategoria] = useState(CATEGORIAS_SAIDA[0]);
   const [valor, setValor] = useState('');
   const [descricao, setDescricao] = useState('');
-  const [canal, setCanal] = useState(CANAIS_PAGAMENTO_SAIDA[0]);
-  const [ok, setOk] = useState(false);
+  const [dataSaida, setDataSaida] = useState(data || hoje());
+  const [modo, setModo] = useState(CANAIS_PAGAMENTO_SAIDA[0]);
+  const [partes, setPartes] = useState({});
+  const [aQuem, setAQuem] = useState('');
+  const [vencimento, setVencimento] = useState('');
+  const [erro, setErro] = useState('');
+  const [ok, setOk] = useState('');
+
+  useEffect(() => { if (data) setDataSaida(data); }, [data]);
+
+  const total = Number(valor) || 0;
+  const varios = modo === '__varios__';
+  const tudoAPagar = modo === '__a_pagar__';
+  const pagoAgora = varios ? CANAIS_PAGAMENTO_SAIDA.reduce((s, cn) => s + (Number(partes[cn]) || 0), 0) : (tudoAPagar ? 0 : total);
+  const aPagar = Math.round((total - pagoAgora) * 100) / 100;
+
+  function completarCom(cn) {
+    const outros = CANAIS_PAGAMENTO_SAIDA.filter(x => x !== cn).reduce((s, x) => s + (Number(partes[x]) || 0), 0);
+    setPartes({ ...partes, [cn]: String(Math.max(0, Math.round((total - outros) * 100) / 100)) });
+  }
 
   function lancar(e) {
     if (e && e.preventDefault) e.preventDefault();
-    if (!valor) return;
-    db.lancarMovimentoManual({ tipo: 'saida', categoria, valor: Number(valor), descricao, criadoPor: profile?.id, canalPagamento: canal, data });
-    setValor(''); setDescricao('');
-    setOk(true); setTimeout(() => setOk(false), 2000);
+    setErro('');
+    if (total <= 0) { setErro('Indique o valor total da saída.'); return; }
+    if (aPagar < -0.009) { setErro(`Os valores pagos passam o total em ${(-aPagar).toFixed(2)} €.`); return; }
+    const desc = descricao.trim();
+    const pagamentos = varios
+      ? CANAIS_PAGAMENTO_SAIDA.map(cn => ({ canal: cn, valor: Number(partes[cn]) || 0 })).filter(p => p.valor > 0)
+      : (tudoAPagar ? [] : [{ canal: modo, valor: total }]);
+    pagamentos.forEach(p => db.lancarMovimentoManual({
+      tipo: 'saida', categoria, valor: p.valor,
+      descricao: desc + (aPagar > 0.009 ? ' (pago em parte)' : ''),
+      criadoPor: profile?.id, canalPagamento: p.canal, data: dataSaida,
+    }));
+    if (aPagar > 0.009) {
+      db.adicionarContaPagar({
+        fornecedor: aQuem.trim() || desc || categoria, categoria, valor: aPagar,
+        dataVencimento: vencimento || null, criadoPor: profile?.id,
+      });
+    }
+    setOk(aPagar > 0.009 ? `Lançada ✓ — ${aPagar.toFixed(2)} € ficou em Contas a pagar` : 'Lançada ✓');
+    setTimeout(() => setOk(''), 3500);
+    setValor(''); setDescricao(''); setPartes({}); setAQuem(''); setVencimento(''); setModo(CANAIS_PAGAMENTO_SAIDA[0]);
   }
 
   return (
-    <form onSubmit={lancar} style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, alignItems: 'end' }}>
-      <div><label>Categoria</label>
-        <select value={categoria} onChange={e => setCategoria(e.target.value)}>
-          {CATEGORIAS_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
+    <form onSubmit={lancar}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, alignItems: 'end' }}>
+        <div><label>Categoria</label>
+          <select value={categoria} onChange={e => setCategoria(e.target.value)}>
+            {CATEGORIAS_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div><label>Valor total (€)</label><input type="number" step="0.01" min="0" value={valor} onChange={e => setValor(e.target.value)} /></div>
+        <div><label>Como foi pago</label>
+          <select value={modo} onChange={e => { setModo(e.target.value); setPartes({}); }}>
+            {CANAIS_PAGAMENTO_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
+            <option value="__a_pagar__">A pagar (ainda não pago)</option>
+            <option value="__varios__">Vários métodos / pago em parte</option>
+          </select>
+        </div>
+        {comData && <div><label>Data</label><input type="date" value={dataSaida} onChange={e => setDataSaida(e.target.value)} /></div>}
+        <div style={{ minWidth: 160 }}><label>Descrição</label><input value={descricao} onChange={e => setDescricao(e.target.value)} placeholder="Opcional" /></div>
       </div>
-      <div><label>Valor (€)</label><input type="number" step="0.01" value={valor} onChange={e => setValor(e.target.value)} /></div>
-      <div><label>Canal</label>
-        <select value={canal} onChange={e => setCanal(e.target.value)}>
-          {CANAIS_PAGAMENTO_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
+
+      {varios && (
+        <div style={{ marginTop: 14, padding: 14, background: '#FBF9F6', border: '1px solid var(--cor-linha)', borderRadius: 10 }}>
+          <p style={{ fontSize: 12, fontWeight: 600, color: 'var(--cor-tinta-suave)', marginBottom: 8 }}>Quanto foi pago em cada método — o que faltar fica "a pagar"</p>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            {CANAIS_PAGAMENTO_SAIDA.map(cn => (
+              <div key={cn} style={{ width: 150 }}>
+                <label>{cn} (€)</label>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <input type="number" step="0.01" min="0" value={partes[cn] || ''} onChange={e => setPartes({ ...partes, [cn]: e.target.value })} />
+                  <button className="btn-icon" type="button" title="Pôr aqui o que falta" onClick={() => completarCom(cn)}>⇢</button>
+                </div>
+              </div>
+            ))}
+            <div style={{ width: 150 }}>
+              <label>A pagar (€)</label>
+              <input value={aPagar > 0 ? aPagar.toFixed(2) : '0.00'} readOnly style={{ background: '#F1ECE8', fontWeight: 700, color: aPagar > 0.009 ? 'var(--cor-alerta)' : 'var(--cor-tinta-suave)' }} />
+            </div>
+          </div>
+          <p style={{ fontSize: 12.5, marginTop: 8, fontWeight: 600, color: aPagar < -0.009 ? 'var(--cor-alerta)' : 'var(--cor-tinta)' }}>
+            {aPagar < -0.009 ? `⚠ Os valores passam o total em ${(-aPagar).toFixed(2)} €` : `Pago agora: ${pagoAgora.toFixed(2)} € · A pagar: ${Math.max(0, aPagar).toFixed(2)} €`}
+          </p>
+        </div>
+      )}
+
+      {(tudoAPagar || (varios && aPagar > 0.009)) && (
+        <div style={{ marginTop: 12, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, maxWidth: 480 }}>
+          <div><label>A quem (fica em Contas a pagar)</label><input value={aQuem} onChange={e => setAQuem(e.target.value)} placeholder={descricao || 'Ex: Fornecedor'} /></div>
+          <div><label>Vencimento</label><input type="date" value={vencimento} onChange={e => setVencimento(e.target.value)} /></div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 14, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <button className="btn" type="button" onClick={lancar}>Lançar saída</button>
+        {erro && <span style={{ color: 'var(--cor-alerta)', fontSize: 13 }}>{erro}</span>}
+        {ok && <span style={{ color: 'var(--cor-sucesso)', fontSize: 13 }}>{ok}</span>}
       </div>
-      <div style={{ minWidth: 160 }}><label>Descrição</label><input value={descricao} onChange={e => setDescricao(e.target.value)} placeholder="Opcional" /></div>
-      <div><button className="btn" type="button" onClick={lancar} style={{ width: '100%', justifyContent: 'center' }}>Lançar saída</button></div>
-      {ok && <span style={{ color: 'var(--cor-sucesso)', fontSize: 13 }}>Lançada ✓</span>}
     </form>
   );
 }
@@ -4155,46 +4232,36 @@ function NovoMovimento() {
   const { profile } = useAuth();
   const db = useDB();
   const [tipo, setTipo] = useState('saida');
-  const [categoria, setCategoria] = useState(CATEGORIAS_SAIDA[0]);
-  const [canalPagamento, setCanalPagamento] = useState(CANAIS_PAGAMENTO_SAIDA[0]);
+  const [categoria, setCategoria] = useState('');
   const [valor, setValor] = useState('');
   const [descricao, setDescricao] = useState('');
+  const [data, setData] = useState(hoje());
 
   function submeter(e) {
     if (e && e.preventDefault) e.preventDefault();
     if (!categoria || !valor) return;
-    db.lancarMovimentoManual({ tipo, categoria, valor: Number(valor), descricao, criadoPor: profile?.id, canalPagamento: tipo === 'saida' ? canalPagamento : undefined });
+    db.lancarMovimentoManual({ tipo: 'entrada', categoria, valor: Number(valor), descricao, criadoPor: profile?.id, data });
     setValor(''); setDescricao('');
   }
 
   return (
-    <div className="card" style={{ maxWidth: 440 }}>
-      <form onSubmit={submeter}>
-        <div className="form-row"><label>Tipo</label>
-          <select value={tipo} onChange={e => { setTipo(e.target.value); if (e.target.value === 'saida') setCategoria(CATEGORIAS_SAIDA[0]); else setCategoria(''); }}>
-            <option value="saida">Saída</option><option value="entrada">Entrada</option>
-          </select>
-        </div>
-        <div className="form-row"><label>Categoria</label>
-          {tipo === 'saida' ? (
-            <select value={categoria} onChange={e => setCategoria(e.target.value)}>
-              {CATEGORIAS_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
-            </select>
-          ) : (
-            <input value={categoria} onChange={e => setCategoria(e.target.value)} placeholder="Ex: Vendas, Outro" />
-          )}
-        </div>
-        {tipo === 'saida' && (
-          <div className="form-row"><label>Como foi pago</label>
-            <select value={canalPagamento} onChange={e => setCanalPagamento(e.target.value)}>
-              {CANAIS_PAGAMENTO_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
-            </select>
-          </div>
-        )}
-        <div className="form-row"><label>Valor (€)</label><input type="number" step="0.01" value={valor} onChange={e => setValor(e.target.value)} /></div>
-        <div className="form-row"><label>Descrição</label><input value={descricao} onChange={e => setDescricao(e.target.value)} /></div>
-        <button className="btn" type="button" onClick={submeter}>Lançar movimento</button>
-      </form>
+    <div className="card">
+      <div className="form-row" style={{ maxWidth: 200 }}><label>Tipo</label>
+        <select value={tipo} onChange={e => setTipo(e.target.value)}>
+          <option value="saida">Saída</option><option value="entrada">Entrada</option>
+        </select>
+      </div>
+      {tipo === 'saida' ? (
+        <FormSaidaRapida db={db} profile={profile} comData />
+      ) : (
+        <form onSubmit={submeter} style={{ maxWidth: 440 }}>
+          <div className="form-row"><label>Categoria</label><input value={categoria} onChange={e => setCategoria(e.target.value)} placeholder="Ex: Vendas, Outro" /></div>
+          <div className="form-row"><label>Valor (€)</label><input type="number" step="0.01" value={valor} onChange={e => setValor(e.target.value)} /></div>
+          <div className="form-row"><label>Data</label><input type="date" value={data} onChange={e => setData(e.target.value)} /></div>
+          <div className="form-row"><label>Descrição</label><input value={descricao} onChange={e => setDescricao(e.target.value)} /></div>
+          <button className="btn" type="button" onClick={submeter}>Lançar entrada</button>
+        </form>
+      )}
     </div>
   );
 }
