@@ -789,6 +789,55 @@ function useMockDB() {
     supaUpdateCompra(id, { ...patch, preco_total: precoTotal });
   }
 
+  // Corrige uma compra já recebida: acerta o estoque e o movimento do Financeiro correspondente
+  function corrigirCompra(id, { quantidade, preco_unitario, fornecedor, data_compra, canal_pagamento }) {
+    const compra = compras.find(c => c.id === id);
+    if (!compra || !compra.recebido) return { financeiro: false };
+    const r2 = n => Math.round(n * 100) / 100;
+    const lote = compra.confirmado_em ? compras.filter(c => c.recebido && c.confirmado_em === compra.confirmado_em) : [compra];
+    const totalAntigoLote = lote.reduce((t, c) => t + Number(c.preco_total), 0);
+    const diaConfirmacao = compra.confirmado_em ? compra.confirmado_em.slice(0, 10) : null;
+    const mov = financeiro.find(m => m.origem === 'compra_estoque' && m.tipo === 'saida'
+      && Math.abs(Number(m.valor) - totalAntigoLote) < 0.015
+      && (m.canal_pagamento || null) === (compra.canal_pagamento || null)
+      && (m.data === compra.data_compra || m.data === diaConfirmacao)
+      && (lote.length > 1 || !m.produto_id || m.produto_id === compra.produto_id));
+
+    const novoTotalLinha = r2(quantidade * preco_unitario);
+    const novoTotalLote = r2(totalAntigoLote - Number(compra.preco_total) + novoTotalLinha);
+    const diffQtd = quantidade - Number(compra.quantidade);
+
+    // compras: a linha editada leva quantidade/preço; fornecedor, data e canal aplicam-se a toda a fatura
+    const idsLote = new Set(lote.map(c => c.id));
+    setCompras(cs => cs.map(c => {
+      if (c.id === id) return { ...c, quantidade, preco_unitario, preco_total: novoTotalLinha, fornecedor, data_compra, canal_pagamento };
+      if (idsLote.has(c.id)) return { ...c, fornecedor, data_compra, canal_pagamento };
+      return c;
+    }));
+    lote.forEach(c => {
+      if (c.id === id) supaUpdateCompra(c.id, { quantidade, preco_unitario, preco_total: novoTotalLinha, fornecedor, data_compra, canal_pagamento });
+      else supaUpdateCompra(c.id, { fornecedor, data_compra, canal_pagamento });
+    });
+
+    // estoque
+    if (diffQtd !== 0) {
+      const novoValor = (produtos.find(p => p.id === compra.produto_id)?.estoque_atual || 0) + diffQtd;
+      setProdutos(ps => ps.map(p => p.id === compra.produto_id ? { ...p, estoque_atual: novoValor } : p));
+      supaUpdateEstoque(compra.produto_id, novoValor);
+    }
+
+    // financeiro
+    if (mov) {
+      const sufixo = /\(c\/ IVA\)$/.test(mov.descricao || '') ? ' (c/ IVA)' : (/\(a caminho\)$/.test(mov.descricao || '') ? ' (a caminho)' : '');
+      const forn = fornecedor || 'fornecedor não indicado';
+      const descricao = lote.length > 1
+        ? `Compra de ${lote.length} artigos — ${forn}${sufixo}`
+        : `Compra de ${quantidade} x ${nomeProduto(compra.produto_id)} — ${forn}${sufixo}`;
+      atualizarMovimentoFinanceiro(mov.id, { valor: novoTotalLote, data: data_compra, canal_pagamento, descricao });
+    }
+    return { financeiro: !!mov };
+  }
+
   function confirmarChegadaCompra(compraId, confirmadoPor, canalPagamento) {
     const compra = compras.find(c => c.id === compraId);
     if (!compra || compra.recebido) return;
@@ -1174,7 +1223,7 @@ function useMockDB() {
     canaisAquisicao, anuncios, parcerias, influencers, marketingOffline, indicacoes, estrategiasVendas, funisVendas, marcacoes, listaEspera, eventosCalendario, comissoes, despesasRecorrentes, investimentosExternos, colaboradorasNomes,
     canaisOps, anunciosOps, parceriasOps, influencersOps, offlineOps, indicacoesOps, estrategiasOps, funisOps, marcacoesOps, listaEsperaOps, eventosOps, despesasRecorrentesOps, gerarContasRecorrentesDoMes, investimentosOps, colaboradorasNomesOps, fornecedoresNomes, fornecedoresNomesOps,
     nomeColaborador, nomeProduto, unidadeProduto, produtosEstoqueBaixo, carregadoDoSupabase,
-    pedirReposicao, cancelarPedido, removerItemLista, registarCompra, registarCompraFatura, atualizarCompra, confirmarChegadaCompra, lancarMovimentoManual, atualizarMovimentoFinanceiro, removerMovimentoFinanceiro, registarVenda, lancarFechoCaixa, adicionarProdutoEmFalta, registarSaidaEstoque, confirmarRecebimento,
+    pedirReposicao, cancelarPedido, removerItemLista, registarCompra, registarCompraFatura, atualizarCompra, corrigirCompra, confirmarChegadaCompra, lancarMovimentoManual, atualizarMovimentoFinanceiro, removerMovimentoFinanceiro, registarVenda, lancarFechoCaixa, adicionarProdutoEmFalta, registarSaidaEstoque, confirmarRecebimento,
     entregasEstoque, entregarDoEstoque, confirmarRecebimentoEstoque, resolverPedidoNaSaida,
     alicatesAfiar, pedirAfiacao, marcarEntregueAmolador, marcarDevolvidoAmolador, confirmarRecebimentoAfiacao, quantidadeAfiadaUltimos3Meses,
     adicionarComissao, atualizarComissao, removerComissao, marcarComissaoPaga, desfazerComissaoPaga, pagamentosComissao, calcularComissao, valorFinalComissao, totalDescontos, percentagemComissao, regraComissao, setRegraComissao, descontosFixos, descontosFixosOps, descontoFixoDe,
@@ -2568,6 +2617,67 @@ function ConfirmarChegadaRow({ c, db, onConfirmar }) {
   );
 }
 
+function CompraRegistadaRow({ c, db }) {
+  const [aEditar, setAEditar] = useState(false);
+  const [fornecedor, setFornecedor] = useState(c.fornecedor || '');
+  const [quantidade, setQuantidade] = useState(String(c.quantidade));
+  const [preco, setPreco] = useState(String(c.preco_unitario));
+  const [data, setData] = useState(c.data_compra);
+  const [canal, setCanal] = useState(c.canal_pagamento || CANAIS_PAGAMENTO_SAIDA[0]);
+  const [aviso, setAviso] = useState(null);
+
+  function abrir() {
+    setFornecedor(c.fornecedor || ''); setQuantidade(String(c.quantidade)); setPreco(String(c.preco_unitario));
+    setData(c.data_compra); setCanal(c.canal_pagamento || CANAIS_PAGAMENTO_SAIDA[0]); setAEditar(true);
+  }
+  function guardar() {
+    if (!(Number(quantidade) > 0) || preco === '' || Number(preco) < 0) return;
+    const res = db.corrigirCompra(c.id, { quantidade: Number(quantidade), preco_unitario: Number(preco), fornecedor, data_compra: data, canal_pagamento: canal });
+    setAEditar(false);
+    if (!res.financeiro) { setAviso('Não encontrei a saída desta compra no Financeiro — corrige o valor lá à mão, em Financeiro.'); setTimeout(() => setAviso(null), 10000); }
+  }
+
+  if (aEditar) {
+    return (
+      <tr>
+        <td><input type="date" value={data} onChange={e => setData(e.target.value)} style={{ width: 130 }} /></td>
+        <td>{db.nomeProduto(c.produto_id)}</td>
+        <td><input value={fornecedor} onChange={e => setFornecedor(e.target.value)} style={{ minWidth: 110 }} /></td>
+        <td><input type="number" step="0.01" value={quantidade} onChange={e => setQuantidade(e.target.value)} style={{ width: 70 }} /></td>
+        <td><input type="number" step="0.0001" value={preco} onChange={e => setPreco(e.target.value)} style={{ width: 90 }} /></td>
+        <td>{(Math.round(Number(quantidade) * Number(preco) * 100) / 100 || 0).toFixed(2)} €</td>
+        <td>
+          <select value={canal} onChange={e => setCanal(e.target.value)} className="select-compacto">
+            {CANAIS_PAGAMENTO_SAIDA.map(cn => <option key={cn} value={cn}>{cn}</option>)}
+          </select>
+        </td>
+        <td>
+          <div className="acoes-linha">
+            <button className="btn" style={{ padding: '7px 12px', fontSize: 12.5 }} onClick={guardar}>Guardar</button>
+            <button className="btn-icon" title="Cancelar" onClick={() => setAEditar(false)}>×</button>
+          </div>
+        </td>
+      </tr>
+    );
+  }
+
+  return (
+    <>
+      <tr>
+        <td>{formatarData(c.data_compra)}</td>
+        <td>{db.nomeProduto(c.produto_id)}</td>
+        <td>{c.fornecedor || '—'}</td>
+        <td>{c.quantidade} {db.unidadeProduto(c.produto_id)}</td>
+        <td>{Number(c.preco_unitario).toFixed(2)} €</td>
+        <td>{Number(c.preco_total).toFixed(2)} €</td>
+        <td>{c.canal_pagamento || '—'}</td>
+        <td><div className="acoes-linha"><button className="btn-icon" title="Editar compra" onClick={abrir}>✎</button></div></td>
+      </tr>
+      {aviso && <tr><td colSpan={8} style={{ fontSize: 12.5, color: 'var(--cor-alerta)' }}>{aviso}</td></tr>}
+    </>
+  );
+}
+
 function RegistarCompraTab() {
   const { profile } = useAuth();
   const db = useDB();
@@ -2752,6 +2862,26 @@ function RegistarCompraTab() {
           </tbody>
         </table>
       </div>}
+
+      <ComprasRegistadas db={db} />
+    </div>
+  );
+}
+
+function ComprasRegistadas({ db }) {
+  const [verTodas, setVerTodas] = useState(false);
+  const feitas = db.compras.filter(c => c.recebido).sort((a, b) => b.data_compra.localeCompare(a.data_compra) || (b.confirmado_em || '').localeCompare(a.confirmado_em || ''));
+  const lista = verTodas ? feitas : feitas.slice(0, 30);
+  return (
+    <div className="card" style={{ marginTop: 22 }}>
+      <h3 style={{ marginBottom: 4 }}>Compras registadas ({feitas.length})</h3>
+      <p style={{ fontSize: 13, color: 'var(--cor-tinta-suave)', marginBottom: 14 }}>Enganou-se num preço ou numa quantidade? Carrega no ✎ — o estoque e o valor no Financeiro são acertados automaticamente. Preço unitário já com IVA.</p>
+      <table>
+        <thead><tr><th>Data</th><th>Produto</th><th>Fornecedor</th><th>Quantidade</th><th>Preço un.</th><th>Total</th><th>Pagamento</th><th></th></tr></thead>
+        <tbody>{lista.map(c => <CompraRegistadaRow key={c.id} c={c} db={db} />)}</tbody>
+      </table>
+      {feitas.length === 0 && <p className="empty-state">Ainda não há compras registadas.</p>}
+      {feitas.length > 30 && <button className="btn btn-secundario" style={{ marginTop: 12 }} onClick={() => setVerTodas(v => !v)}>{verTodas ? 'Mostrar só as últimas 30' : `Mostrar todas (${feitas.length})`}</button>}
     </div>
   );
 }
