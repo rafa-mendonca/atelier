@@ -346,6 +346,7 @@ async function supaInsertCompra(c) {
     quantidade: c.quantidade, preco_unitario: c.preco_unitario, preco_total: c.preco_total,
     comprado_por: c.comprado_por || null, canal_pagamento: c.canal_pagamento, pago: c.pago,
     data_compra: c.data_compra, data_prevista_entrega: c.data_prevista_entrega, recebido: c.recebido,
+    confirmado_por: c.confirmado_por || null, confirmado_em: c.confirmado_em || null,
   });
   if (error) console.error('Supabase (compras insert):', error.message);
 }
@@ -741,6 +742,46 @@ function useMockDB() {
     }
   }
 
+  // Compra de uma fatura inteira (vários artigos): entra logo no estoque e no Financeiro, com IVA incluído
+  function registarCompraFatura({ fornecedor, data, itens, canalPagamento, compradoPor }) {
+    const dataCompra = data || hoje();
+    const confirmadoEm = new Date().toISOString();
+    const usados = new Set();
+    const qtdPorProduto = {};
+    let total = 0;
+    itens.forEach(it => {
+      qtdPorProduto[it.produtoId] = (qtdPorProduto[it.produtoId] || 0) + it.quantidade;
+      const pedido = listaCompras.filter(l => l.status === 'pendente' && l.produto_id === it.produtoId && !usados.has(l.id)).sort((a, b) => a.criado_em.localeCompare(b.criado_em))[0];
+      let linkId = null;
+      if (pedido) {
+        usados.add(pedido.id); linkId = pedido.id;
+        setListaCompras(l => l.map(x => x.id === pedido.id ? { ...x, status: 'em_estoque' } : x));
+        supaUpdateListaCompra(pedido.id, { status: 'em_estoque' });
+      }
+      const compra = { id: uid(), produto_id: it.produtoId, lista_compra_id: linkId, fornecedor: fornecedor || '', quantidade: it.quantidade, preco_unitario: it.precoUnitario, preco_total: it.precoTotal, comprado_por: compradoPor, canal_pagamento: canalPagamento, pago: true, data_compra: dataCompra, data_prevista_entrega: null, recebido: true, confirmado_por: compradoPor, confirmado_em: confirmadoEm };
+      setCompras(c => [compra, ...c]);
+      supaInsertCompra(compra);
+      total += it.precoTotal;
+    });
+    Object.entries(qtdPorProduto).forEach(([pid, qtd]) => {
+      const novoValor = (produtos.find(p => p.id === pid)?.estoque_atual || 0) + qtd;
+      setProdutos(ps => ps.map(p => p.id === pid ? { ...p, estoque_atual: novoValor } : p));
+      supaUpdateEstoque(pid, novoValor);
+    });
+    total = Math.round(total * 100) / 100;
+    const descricao = itens.length === 1
+      ? `Compra de ${itens[0].quantidade} x ${nomeProduto(itens[0].produtoId)} — ${fornecedor || 'fornecedor não indicado'} (c/ IVA)`
+      : `Compra de ${itens.length} artigos — ${fornecedor || 'fornecedor não indicado'} (c/ IVA)`;
+    const mov = { id: uid(), tipo: 'saida', categoria: 'Materiais', valor: total, descricao, produto_id: itens.length === 1 ? itens[0].produtoId : null, origem: 'compra_estoque', canal_pagamento: canalPagamento, criado_por: compradoPor, data: dataCompra };
+    setFinanceiro(f => [mov, ...f]);
+    supaInsertFinanceiro(mov);
+    const avisos = Object.keys(qtdPorProduto).map(pid => {
+      const outros = listaCompras.filter(l => l.status === 'pendente' && l.produto_id === pid && !usados.has(l.id));
+      return outros.length ? { produto: nomeProduto(pid), pessoas: outros.map(o => o.solicitado_por_nome || 'alguém') } : null;
+    }).filter(Boolean);
+    return { total, avisos };
+  }
+
   function atualizarCompra(id, patch) {
     setCompras(c => c.map(item => item.id === id ? { ...item, ...patch, preco_total: (patch.quantidade ?? item.quantidade) * (patch.preco_unitario ?? item.preco_unitario) } : item));
     const item = compras.find(c => c.id === id);
@@ -1133,7 +1174,7 @@ function useMockDB() {
     canaisAquisicao, anuncios, parcerias, influencers, marketingOffline, indicacoes, estrategiasVendas, funisVendas, marcacoes, listaEspera, eventosCalendario, comissoes, despesasRecorrentes, investimentosExternos, colaboradorasNomes,
     canaisOps, anunciosOps, parceriasOps, influencersOps, offlineOps, indicacoesOps, estrategiasOps, funisOps, marcacoesOps, listaEsperaOps, eventosOps, despesasRecorrentesOps, gerarContasRecorrentesDoMes, investimentosOps, colaboradorasNomesOps, fornecedoresNomes, fornecedoresNomesOps,
     nomeColaborador, nomeProduto, unidadeProduto, produtosEstoqueBaixo, carregadoDoSupabase,
-    pedirReposicao, cancelarPedido, removerItemLista, registarCompra, atualizarCompra, confirmarChegadaCompra, lancarMovimentoManual, atualizarMovimentoFinanceiro, removerMovimentoFinanceiro, registarVenda, lancarFechoCaixa, adicionarProdutoEmFalta, registarSaidaEstoque, confirmarRecebimento,
+    pedirReposicao, cancelarPedido, removerItemLista, registarCompra, registarCompraFatura, atualizarCompra, confirmarChegadaCompra, lancarMovimentoManual, atualizarMovimentoFinanceiro, removerMovimentoFinanceiro, registarVenda, lancarFechoCaixa, adicionarProdutoEmFalta, registarSaidaEstoque, confirmarRecebimento,
     entregasEstoque, entregarDoEstoque, confirmarRecebimentoEstoque, resolverPedidoNaSaida,
     alicatesAfiar, pedirAfiacao, marcarEntregueAmolador, marcarDevolvidoAmolador, confirmarRecebimentoAfiacao, quantidadeAfiadaUltimos3Meses,
     adicionarComissao, atualizarComissao, removerComissao, marcarComissaoPaga, desfazerComissaoPaga, pagamentosComissao, calcularComissao, valorFinalComissao, totalDescontos, percentagemComissao, regraComissao, setRegraComissao, descontosFixos, descontosFixosOps, descontoFixoDe,
@@ -2530,32 +2571,39 @@ function ConfirmarChegadaRow({ c, db, onConfirmar }) {
 function RegistarCompraTab() {
   const { profile } = useAuth();
   const db = useDB();
+  const IVA_PCT = 23;
   const pendentes = db.listaCompras.filter(l => l.status === 'pendente');
-  const [produtoId, setProdutoId] = useState('');
-  const [listaCompraId, setListaCompraId] = useState('');
+  const novaLinha = (produtoId = '', quantidade = '') => ({ key: uid(), produtoId, quantidade: String(quantidade), preco: '' });
   const [fornecedor, setFornecedor] = useState('');
   const [novoFornecedor, setNovoFornecedor] = useState(false);
   const [nomeNovoFornecedor, setNomeNovoFornecedor] = useState('');
-  const [quantidade, setQuantidade] = useState('');
-  const [precoUnitario, setPrecoUnitario] = useState('');
-  const [dataPrevistaEntrega, setDataPrevistaEntrega] = useState('');
-  const [jaPago, setJaPago] = useState('nao');
+  const [dataCompra, setDataCompra] = useState(hoje());
   const [canalPagamento, setCanalPagamento] = useState(CANAIS_PAGAMENTO_SAIDA[0]);
-  const [ok, setOk] = useState(false);
-  const [okData, setOkData] = useState(null);
-  const [okJaPago, setOkJaPago] = useState(false);
+  const [modoIva, setModoIva] = useState('sem');
+  const [linhas, setLinhas] = useState([novaLinha()]);
+  const [totalFatura, setTotalFatura] = useState('');
+  const [ok, setOk] = useState(null);
   const [avisoEspera, setAvisoEspera] = useState(null);
 
-  function selecionarPedido(id) {
-    setListaCompraId(id);
-    const item = pendentes.find(l => l.id === id);
-    if (item) {
-      setProdutoId(item.produto_id);
-      setQuantidade(item.quantidade_solicitada);
-      setDataPrevistaEntrega(dataPrevistaPorUrgencia(item.urgencia));
-    } else {
-      setDataPrevistaEntrega('');
-    }
+  const fator = modoIva === 'sem' ? 1 + IVA_PCT / 100 : 1;
+  const r2 = n => Math.round(n * 100) / 100;
+  const linhaValida = l => l.produtoId && Number(l.quantidade) > 0 && l.preco !== '' && Number(l.preco) >= 0;
+  const linhaVazia = l => !l.produtoId && !l.quantidade && !l.preco;
+  const validas = linhas.filter(linhaValida);
+  const incompletas = linhas.filter(l => !linhaValida(l) && !linhaVazia(l));
+  const totalLinha = l => r2(Number(l.quantidade) * Number(l.preco) * fator);
+  const totalComIva = validas.reduce((s, l) => s + totalLinha(l), 0);
+  const subtotalSemIva = modoIva === 'sem' ? validas.reduce((s, l) => s + Number(l.quantidade) * Number(l.preco), 0) : (modoIva === 'com' ? totalComIva / (1 + IVA_PCT / 100) : totalComIva);
+  const valorIva = totalComIva - subtotalSemIva;
+  const diferenca = totalFatura !== '' ? r2(Number(totalFatura) - totalComIva) : null;
+
+  function atualizarLinha(key, patch) { setLinhas(ls => ls.map(l => l.key === key ? { ...l, ...patch } : l)); }
+  function removerLinha(key) { setLinhas(ls => ls.length > 1 ? ls.filter(l => l.key !== key) : [novaLinha()]); }
+  function adicionarPedido(pedido) {
+    setLinhas(ls => {
+      const semVazias = ls.filter(l => !linhaVazia(l));
+      return [...semVazias, novaLinha(pedido.produto_id, pedido.quantidade_solicitada)];
+    });
   }
 
   function confirmarNovoFornecedor() {
@@ -2568,115 +2616,133 @@ function RegistarCompraTab() {
 
   function registar(e) {
     if (e && e.preventDefault) e.preventDefault();
-    if (!produtoId || !quantidade || !precoUnitario || !fornecedor) return;
-    db.registarCompra({ produtoId, listaCompraId: listaCompraId || null, quantidade: Number(quantidade), precoUnitario: Number(precoUnitario), compradoPor: profile?.id, dataPrevistaEntrega: dataPrevistaEntrega || null, fornecedor, jaPago: jaPago === 'sim', canalPagamento });
-    setOkData(dataPrevistaEntrega || null);
-    setOkJaPago(jaPago === 'sim');
-    setProdutoId(''); setListaCompraId(''); setQuantidade(''); setPrecoUnitario(''); setDataPrevistaEntrega(''); setFornecedor(''); setJaPago('nao');
-    setOk(true); setTimeout(() => setOk(false), 4000);
+    if (!fornecedor || validas.length === 0 || incompletas.length > 0) return;
+    const itens = validas.map(l => ({ produtoId: l.produtoId, quantidade: Number(l.quantidade), precoUnitario: Math.round(Number(l.preco) * fator * 10000) / 10000, precoTotal: totalLinha(l) }));
+    const res = db.registarCompraFatura({ fornecedor, data: dataCompra, itens, canalPagamento, compradoPor: profile?.id });
+    setOk({ n: itens.length, total: res.total });
+    setAvisoEspera(res.avisos.length ? res.avisos : null);
+    setLinhas([novaLinha()]); setTotalFatura(''); setFornecedor('');
+    setTimeout(() => setOk(null), 6000);
+    if (res.avisos.length) setTimeout(() => setAvisoEspera(null), 10000);
   }
 
   function confirmarChegada(compra, canal) {
     db.confirmarChegadaCompra(compra.id, profile?.id, canal);
-    const outrosPendentes = db.listaCompras.filter(l => l.status === 'pendente' && l.produto_id === compra.produto_id && l.id !== compra.lista_compra_id);
-    if (outrosPendentes.length > 0) {
-      setAvisoEspera({ produto: db.nomeProduto(compra.produto_id), pessoas: outrosPendentes.map(p => p.solicitado_por_nome || 'alguém') });
-      setTimeout(() => setAvisoEspera(null), 8000);
-    }
   }
 
-  const pedidoSelecionado = pendentes.find(l => l.id === listaCompraId);
   const porConfirmar = [...db.compras].filter(c => !c.recebido).sort((a, b) => (a.data_prevista_entrega || a.data_compra).localeCompare(b.data_prevista_entrega || b.data_compra));
+  const pedidosPorAdicionar = pendentes.filter(p => !linhas.some(l => l.produtoId === p.produto_id));
 
   return (
     <div>
-      <div className="card" style={{ marginBottom: 22, maxWidth: 480 }}>
-        <p style={{ fontSize: 13, color: 'var(--cor-tinta-suave)', marginBottom: 18 }}>Regista o pedido ao fornecedor — o estoque e o Financeiro só são atualizados quando confirmares que chegou, incluindo como foi pago.</p>
+      <div className="card" style={{ marginBottom: 22, maxWidth: 780 }}>
+        <p style={{ fontSize: 13, color: 'var(--cor-tinta-suave)', marginBottom: 18 }}>Regista a fatura inteira de uma vez, com todos os artigos. Ao registar, o material <strong>entra logo no estoque</strong> e o valor total (com IVA) é lançado no Financeiro.</p>
         <form onSubmit={registar}>
-          {pendentes.length > 0 && (
-            <div className="form-row">
-              <label>Pedido da lista de compras (opcional)</label>
-              <select value={listaCompraId} onChange={e => selecionarPedido(e.target.value)}>
-                <option value="">— compra avulsa —</option>
-                {pendentes.map(l => <option key={l.id} value={l.id}>{db.nomeProduto(l.produto_id)} — {l.quantidade_solicitada} {db.unidadeProduto(l.produto_id)} ({urgenciaInfo(l.urgencia).label})</option>)}
+          <div className="form-row" style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: 10 }}>
+            <div>
+              <label>Fornecedor</label>
+              {!novoFornecedor ? (
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <select value={fornecedor} onChange={e => setFornecedor(e.target.value)} style={{ flex: 1 }}>
+                    <option value="">Seleciona…</option>
+                    {db.fornecedoresNomes.map(f => <option key={f.id} value={f.nome}>{f.nome}</option>)}
+                  </select>
+                  <button className="btn btn-secundario" type="button" onClick={() => setNovoFornecedor(true)}>+ Novo</button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input value={nomeNovoFornecedor} onChange={e => setNomeNovoFornecedor(e.target.value)} placeholder="Nome do fornecedor" style={{ flex: 1 }} />
+                  <button className="btn btn-secundario" type="button" onClick={confirmarNovoFornecedor}>Guardar</button>
+                  <button className="btn-icon" type="button" onClick={() => setNovoFornecedor(false)}>×</button>
+                </div>
+              )}
+            </div>
+            <div><label>Data da compra</label><input type="date" value={dataCompra} onChange={e => setDataCompra(e.target.value)} /></div>
+            <div>
+              <label>Como foi pago</label>
+              <select value={canalPagamento} onChange={e => setCanalPagamento(e.target.value)}>
+                {CANAIS_PAGAMENTO_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
               </select>
+            </div>
+          </div>
+
+          {pedidosPorAdicionar.length > 0 && (
+            <div className="form-row">
+              <label>Pedidos da lista de compras — clica para juntar à fatura</label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {pedidosPorAdicionar.map(l => {
+                  const urg = urgenciaInfo(l.urgencia);
+                  return (
+                    <button key={l.id} type="button" className="btn btn-secundario" style={{ fontSize: 12.5, padding: '6px 10px', borderColor: urg.cor, color: urg.cor }} onClick={() => adicionarPedido(l)}>
+                      + {db.nomeProduto(l.produto_id)} ({l.quantidade_solicitada} {db.unidadeProduto(l.produto_id)}) · {urg.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           )}
-          {pedidoSelecionado && (() => {
-            const urg = urgenciaInfo(pedidoSelecionado.urgencia);
-            const regra = pedidoSelecionado.urgencia === 'emergencia' ? 'comprar já, hoje' : pedidoSelecionado.urgencia === 'urgente' ? 'comprar no dia seguinte' : 'pode esperar até sábado, dia de compras';
-            return (
-              <div style={{ background: urg.fundo, border: `1px solid ${urg.cor}`, borderRadius: 10, padding: '10px 14px', marginBottom: 14, fontSize: 13, color: urg.cor }}>
-                <strong>{urg.label}</strong> — {regra}.
-              </div>
-            );
-          })()}
+
           <div className="form-row">
-            <label>Produto</label>
-            <select value={produtoId} onChange={e => setProdutoId(e.target.value)}>
-              <option value="">Seleciona…</option>
-              {db.produtos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
+            <label>Os preços da fatura estão…</label>
+            <select value={modoIva} onChange={e => setModoIva(e.target.value)} style={{ maxWidth: 320 }}>
+              <option value="sem">Sem IVA — somar {IVA_PCT}%</option>
+              <option value="com">Com IVA já incluído</option>
+              <option value="isento">Isentos de IVA</option>
             </select>
           </div>
-          <div className="form-row">
-            <label>Fornecedor</label>
-            {!novoFornecedor ? (
-              <div style={{ display: 'flex', gap: 8 }}>
-                <select value={fornecedor} onChange={e => setFornecedor(e.target.value)} style={{ flex: 1 }}>
-                  <option value="">Seleciona…</option>
-                  {db.fornecedoresNomes.map(f => <option key={f.id} value={f.nome}>{f.nome}</option>)}
-                </select>
-                <button className="btn btn-secundario" type="button" onClick={() => setNovoFornecedor(true)}>+ Novo</button>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input value={nomeNovoFornecedor} onChange={e => setNomeNovoFornecedor(e.target.value)} placeholder="Nome do fornecedor" style={{ flex: 1 }} />
-                <button className="btn btn-secundario" type="button" onClick={confirmarNovoFornecedor}>Guardar</button>
-                <button className="btn-icon" type="button" onClick={() => setNovoFornecedor(false)}>×</button>
-              </div>
-            )}
+
+          <table style={{ marginBottom: 10 }}>
+            <thead><tr><th>Produto</th><th style={{ width: 90 }}>Qtd.</th><th style={{ width: 120 }}>Preço un. {modoIva === 'sem' ? '(s/ IVA)' : modoIva === 'com' ? '(c/ IVA)' : ''}</th><th style={{ width: 110, textAlign: 'right' }}>Total c/ IVA</th><th style={{ width: 36 }}></th></tr></thead>
+            <tbody>
+              {linhas.map(l => (
+                <tr key={l.key}>
+                  <td>
+                    <select value={l.produtoId} onChange={e => atualizarLinha(l.key, { produtoId: e.target.value })} style={{ width: '100%' }}>
+                      <option value="">Seleciona…</option>
+                      {db.produtos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
+                    </select>
+                  </td>
+                  <td><input type="number" step="0.01" min="0" value={l.quantidade} onChange={e => atualizarLinha(l.key, { quantidade: e.target.value })} style={{ width: '100%' }} /></td>
+                  <td><input type="number" step="0.01" min="0" value={l.preco} onChange={e => atualizarLinha(l.key, { preco: e.target.value })} style={{ width: '100%' }} /></td>
+                  <td style={{ textAlign: 'right' }}>{linhaValida(l) ? totalLinha(l).toFixed(2) + ' €' : '—'}</td>
+                  <td><button className="btn-icon perigo" type="button" title="Remover linha" onClick={() => removerLinha(l.key)}>×</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <button className="btn btn-secundario" type="button" onClick={() => setLinhas(ls => [...ls, novaLinha()])} style={{ marginBottom: 16 }}>+ Adicionar artigo</button>
+
+          <div style={{ background: 'var(--cor-fundo-suave, #F6F4EF)', borderRadius: 10, padding: '12px 16px', marginBottom: 14, fontSize: 13.5, maxWidth: 360, marginLeft: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>Subtotal sem IVA</span><span>{subtotalSemIva.toFixed(2)} €</span></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}><span>IVA ({modoIva === 'isento' ? 'isento' : IVA_PCT + '%'})</span><span>{valorIva.toFixed(2)} €</span></div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: 15, borderTop: '1px solid var(--cor-borda, #DDD)', marginTop: 6, paddingTop: 6 }}><span>Total da fatura</span><span>{totalComIva.toFixed(2)} €</span></div>
           </div>
-          <div className="form-row" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-            <div><label>Quantidade</label><input type="number" step="0.01" value={quantidade} onChange={e => setQuantidade(e.target.value)} /></div>
-            <div><label>Preço unitário (€)</label><input type="number" step="0.01" value={precoUnitario} onChange={e => setPrecoUnitario(e.target.value)} /></div>
+
+          <div className="form-row" style={{ maxWidth: 360, marginLeft: 'auto' }}>
+            <label>Total que está na fatura (para conferir — opcional)</label>
+            <input type="number" step="0.01" value={totalFatura} onChange={e => setTotalFatura(e.target.value)} placeholder="Ex: 123.45" />
+            {diferenca !== null && (Math.abs(diferenca) < 0.015
+              ? <p style={{ fontSize: 12.5, color: 'var(--cor-sucesso)', marginTop: 6 }}>✓ Bate certo com a fatura.</p>
+              : <p style={{ fontSize: 12.5, color: 'var(--cor-alerta)', marginTop: 6 }}>Diferença de {diferenca.toFixed(2)} € em relação à fatura — confere os preços, as quantidades ou a opção de IVA.</p>)}
           </div>
-          <div className="form-row">
-            <label>Data prevista de entrega</label>
-            <input type="date" value={dataPrevistaEntrega} onChange={e => setDataPrevistaEntrega(e.target.value)} style={{ maxWidth: 200 }} />
-          </div>
-          <div className="form-row" style={{ display: 'grid', gridTemplateColumns: jaPago === 'sim' ? '1fr 1fr' : '1fr', gap: 10 }}>
-            <div>
-              <label>Já foi pago?</label>
-              <select value={jaPago} onChange={e => setJaPago(e.target.value)}>
-                <option value="nao">Ainda não (pago na entrega)</option>
-                <option value="sim">Sim, já foi pago</option>
-              </select>
-            </div>
-            {jaPago === 'sim' && (
-              <div>
-                <label>Como foi pago</label>
-                <select value={canalPagamento} onChange={e => setCanalPagamento(e.target.value)}>
-                  {CANAIS_PAGAMENTO_SAIDA.map(c => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-            )}
-          </div>
-          <button className="btn" type="button" onClick={registar}>Registar compra</button>
+
+          {incompletas.length > 0 && <p style={{ fontSize: 12.5, color: 'var(--cor-alerta)', marginBottom: 10 }}>Há {incompletas.length} linha{incompletas.length > 1 ? 's' : ''} por completar (produto, quantidade e preço) — completa ou remove.</p>}
+          <button className="btn" type="submit" disabled={!fornecedor || validas.length === 0 || incompletas.length > 0}>Registar compra e dar entrada no estoque</button>
           {ok && (
             <div style={{ marginTop: 12, background: '#E5EBDF', border: '1px solid var(--cor-sucesso)', borderRadius: 10, padding: '10px 14px', fontSize: 13, color: 'var(--cor-sucesso)' }}>
-              ✓ Pedido registado{okJaPago ? ' e já lançado como saída no Financeiro' : ''} — {okData ? <>agendado para entrega dia <strong>{new Date(okData + 'T00:00:00').toLocaleDateString('pt-PT')}</strong>.</> : 'sem data de entrega definida.'} Fica à espera em baixo até confirmares a chegada.
+              ✓ {ok.n} artigo{ok.n > 1 ? 's' : ''} com entrada no estoque e <strong>{ok.total.toFixed(2)} €</strong> (com IVA) lançados no Financeiro.
             </div>
           )}
         </form>
       </div>
 
-      {avisoEspera && (
-        <div style={{ background: '#FBF5EA', border: '1px solid var(--cor-dourado)', borderRadius: 10, padding: '10px 14px', marginBottom: 20, fontSize: 13, color: '#8A6A28' }}>
-          ⏰ <strong>{avisoEspera.pessoas.join(', ')}</strong> também está{avisoEspera.pessoas.length > 1 ? 'ão' : ''} à espera de <strong>{avisoEspera.produto}</strong> — já está no estoque, podes entregar em Saída.
+      {avisoEspera && avisoEspera.map(a => (
+        <div key={a.produto} style={{ background: '#FBF5EA', border: '1px solid var(--cor-dourado)', borderRadius: 10, padding: '10px 14px', marginBottom: 12, fontSize: 13, color: '#8A6A28' }}>
+          ⏰ <strong>{a.pessoas.join(', ')}</strong> também está{a.pessoas.length > 1 ? 'ão' : ''} à espera de <strong>{a.produto}</strong> — já está no estoque, podes entregar em Saída.
         </div>
-      )}
+      ))}
 
-      <div className="card">
+      {porConfirmar.length > 0 && <div className="card">
         <h3 style={{ marginBottom: 4 }}>À espera de chegar ({porConfirmar.length})</h3>
         <p style={{ fontSize: 13, color: 'var(--cor-tinta-suave)', marginBottom: 14 }}>Escolhe como foi pago e confirma — entra logo no estoque e no Financeiro.</p>
         <table>
@@ -2685,8 +2751,7 @@ function RegistarCompraTab() {
             {porConfirmar.map(c => <ConfirmarChegadaRow key={c.id} c={c} db={db} onConfirmar={confirmarChegada} />)}
           </tbody>
         </table>
-        {porConfirmar.length === 0 && <p className="empty-state">Nada à espera — tudo o que foi pedido já chegou.</p>}
-      </div>
+      </div>}
     </div>
   );
 }
